@@ -1,0 +1,205 @@
+name: 📚 Generate PDF Ebook
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+  
+  # 也可以设置定时生成（可选）
+  schedule:
+    - cron: '0 0 * * 0'  # 每周一次
+
+jobs:
+  build-ebook:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    
+    steps:
+    - name: 📥 Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: 🐍 Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: 📦 Install Dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y \
+          pandoc \
+          texlive-xetex \
+          texlive-latex-extra \
+          texlive-fonts-recommended \
+          fonts-noto-cjk \
+          imagemagick \
+          ghostscript
+        
+        python -m pip install --upgrade pip
+        pip install -q \
+          nbconvert \
+          jupyter \
+          PyPDF2 \
+          pillow \
+          pandocfilters
+    
+    - name: 📂 Prepare Output
+      run: |
+        mkdir -p build/pdf
+        mkdir -p build/md
+        mkdir -p build/logs
+    
+    - name: 🔍 Scan Repository
+      run: |
+        echo "===== Repository Content =====" | tee build/logs/scan.log
+        echo "Notebooks:" | tee -a build/logs/scan.log
+        find . -name "*.ipynb" ! -path "./.git/*" ! -path "./.github/*" ! -path "./build/*" | sort | tee -a build/logs/scan.log
+        
+        echo "" | tee -a build/logs/scan.log
+        echo "Markdown files:" | tee -a build/logs/scan.log
+        find . -name "*.md" ! -path "./.git/*" ! -path "./.github/*" ! -path "./build/*" ! -name "README*" | sort | tee -a build/logs/scan.log
+    
+    - name: 🔄 Convert Notebooks to Markdown
+      continue-on-error: true
+      run: |
+        echo "===== Converting Notebooks =====" | tee build/logs/conversion.log
+        
+        find . -name "*.ipynb" \
+          ! -path "./.git/*" \
+          ! -path "./.github/*" \
+          ! -path "./build/*" \
+          -type f | sort | while read notebook; do
+          
+          echo "Converting: $notebook" | tee -a build/logs/conversion.log
+          
+          jupyter nbconvert \
+            --to markdown \
+            "$notebook" \
+            --output-dir=build/md \
+            --log-level=0 2>&1 | tee -a build/logs/conversion.log
+        done
+    
+    - name: 📄 Copy Markdown Files
+      continue-on-error: true
+      run: |
+        echo "===== Copying Markdown =====" | tee build/logs/markdown.log
+        
+        find . -name "*.md" \
+          ! -path "./.git/*" \
+          ! -path "./.github/*" \
+          ! -path "./build/*" \
+          ! -name "README*" \
+          -type f | while read md; do
+          
+          cp "$md" build/md/ 2>/dev/null || true
+          echo "Copied: $(basename "$md")" | tee -a build/logs/markdown.log
+        done
+        
+        ls -lh build/md/ | tee -a build/logs/markdown.log
+    
+    - name: 📝 Generate PDF Files
+      continue-on-error: true
+      run: |
+        echo "===== Generating PDFs =====" | tee build/logs/pdf.log
+        
+        cd build/md
+        
+        for md_file in *.md; do
+          [ -f "$md_file" ] || continue
+          
+          pdf_name="${md_file%.md}.pdf"
+          
+          echo "Processing: $md_file → $pdf_name" | tee -a ../logs/pdf.log
+          
+          pandoc "$md_file" \
+            -o "../pdf/$pdf_name" \
+            --pdf-engine=xelatex \
+            -V mainfont='Noto Sans CJK SC' \
+            -V geometry:margin=20mm \
+            -V fontsize=11pt \
+            --toc \
+            --toc-depth=2 \
+            --number-sections \
+            --highlight-style=tango \
+            2>&1 | tee -a ../logs/pdf.log
+        done
+        
+        cd ../..
+    
+    - name: 📚 Merge All PDFs
+      continue-on-error: true
+      run: |
+        python3 << 'EOF'
+        from PyPDF2 import PdfMerger
+        import os
+        
+        pdf_dir = "build/pdf"
+        output_file = "Robotics_Tutorial_Complete.pdf"
+        
+        if not os.path.exists(pdf_dir):
+            print("No PDF directory found")
+            exit(0)
+        
+        pdf_files = sorted([
+            os.path.join(pdf_dir, f) 
+            for f in os.listdir(pdf_dir) 
+            if f.endswith('.pdf')
+        ])
+        
+        if not pdf_files:
+            print("No PDF files found")
+            exit(0)
+        
+        print(f"Found {len(pdf_files)} PDFs, merging...")
+        
+        merger = PdfMerger()
+        for pdf in pdf_files:
+            merger.append(pdf)
+        
+        merger.write(output_file)
+        merger.close()
+        
+        size = os.path.getsize(output_file) / 1024 / 1024
+        print(f"✅ Created: {output_file} ({size:.2f}MB)")
+        EOF
+    
+    - name: 📤 Upload Artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: robotics-ebook
+        path: |
+          build/
+          Robotics_Tutorial_Complete.pdf
+        retention-days: 30
+    
+    - name: 🎉 Release PDF
+      if: success()
+      uses: softprops/action-gh-release@v2
+      with:
+        files: Robotics_Tutorial_Complete.pdf
+        tag_name: ebook-${{ github.run_number }}
+        body: |
+          📚 **Robotics Tutorial - Complete Ebook**
+          
+          - Generated: ${{ github.event.head_commit.timestamp }}
+          - Run: ${{ github.run_number }}
+          
+          Download and enjoy!
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: ✅ Summary
+      if: always()
+      run: |
+        echo "========== Build Summary =========="
+        echo "Generated Files:"
+        ls -lh build/pdf/ 2>/dev/null | head -10
+        echo ""
+        echo "Complete Ebook:"
+        ls -lh Robotics_Tutorial_Complete.pdf 2>/dev/null || echo "Not generated"
+        echo "===================================="
